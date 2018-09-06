@@ -1,0 +1,264 @@
+#!/usr/bin/env bash
+
+set -e
+set -o pipefail
+
+name="$(basename $0)"
+
+if [[ -n ${VERBOSE} && ${VERBOSE} -ne 0 ]]; then
+	set -x
+	verbose=1
+fi
+
+usage () {
+	echo "${name} - Download and create Fedora OS images for packet.net." >&2
+	echo "Usage: ${name} <version> <arch> <outdir>" >&2
+	echo "Option flags:" >&2
+	echo "  -h --help     - Show this help and exit." >&2
+	echo "  -v --verbose  - Verbose execution." >&2
+	echo "Environment:" >&2
+	echo "  VERBOSE   - Default: '${VERBOSE}'" >&2
+	echo "Examples:" >&2
+	echo "  ${name} -v 29 arm64 packet-f29"
+}
+
+short_opts="hv"
+long_opts="help,verbose"
+
+opts=$(getopt --options ${short_opts} --long ${long_opts} -n "${name}" -- "$@")
+
+if [ $? != 0 ]; then
+	echo "${name}: ERROR: Internal getopt" >&2
+	exit 1
+fi
+
+eval set -- "${opts}"
+
+while true ; do
+	case "${1}" in
+	-h | --help)
+		usage=1
+		shift
+		;;
+	-v | --verbose)
+		set -x
+		verbose=1
+		shift
+		;;
+	--)
+		shift
+		version=${1}
+		arch=${2}
+		outdir=${3}
+		if ! shift 3; then
+			echo "${name}: ERROR: Missing args: version='${version}' arch='${arch}' outdir='${outdir}'" >&2
+			usage
+			exit 1
+		fi
+		if [[ -n "${1}" ]]; then
+			echo "${name}: ERROR: Got extra args: ${@}" >&2
+			usage
+			exit 1
+		fi
+		break
+		;;
+	*)
+		echo "${name}: ERROR: Internal opts" >&2
+		exit 1
+		;;
+	esac
+done
+
+if [[ -n "${usage}" ]]; then
+	usage
+	exit 0
+fi
+
+if [[ -z "${version}" || -z "${arch}" || -z "${outdir}" ]]; then
+	echo "${name}: ERROR: Missing args: version='${version}' arch='${arch}' outdir='${outdir}'" >&2
+	usage
+	exit 1
+fi
+
+case ${arch} in
+arm64|aarch64)
+	arch="aarch64"
+	;;
+*)
+	echo "${name}: ERROR: ${arch} is not supported, sorry" >&2
+	exit 1
+	;;
+esac
+
+#f28
+#https://dl.fedoraproject.org/pub/fedora/linux/releases/28/Container/aarch64/images/Fedora-Container-Base-28-1.1.aarch64.tar.xz
+#https://dl.fedoraproject.org/pub/fedora/linux/releases/28/Container/aarch64/images/Fedora-Container-28-1.1-aarch64-CHECKSUM
+
+#https://dl.fedoraproject.org/pub/fedora/linux/releases/28/Server/aarch64/images/Fedora-Server-28-1.1.aarch64.raw.xz
+#https://dl.fedoraproject.org/pub/fedora/linux/releases/28/Server/aarch64/images/Fedora-Server-28-1.1-aarch64-CHECKSUM
+
+#f29
+#https://dl.fedoraproject.org/pub/fedora/linux/development/29/Container/aarch64/images/Fedora-Container-Base-29-20180905.n.0.aarch64.tar.xz
+#https://dl.fedoraproject.org/pub/fedora/linux/development/29/Container/aarch64/images/Fedora-Container-29-aarch64-20180905.n.0-CHECKSUM
+
+#https://dl.fedoraproject.org/pub/fedora/linux/development/29/Server/aarch64/images/Fedora-Server-29-20180905.n.0.aarch64.raw.xz
+#https://dl.fedoraproject.org/pub/fedora/linux/development/29/Server/aarch64/images/Fedora-Server-29-aarch64-20180905.n.0-CHECKSUM
+
+download_server="https://dl.fedoraproject.org/pub/fedora/linux"
+
+case "${version}" in
+'28')
+	download_path="releases/${version}"
+	release="1.1"
+	check_code="${version}-${release}-${arch}"
+	;;
+'29')
+	download_path="development/${version}"
+	release="20180905.n.0"
+	check_code="${version}-${arch}-${release}"
+	;;
+*)
+	echo "${name}: ERROR: Fedora ${version} is not supported, sorry" >&2
+	exit 1
+	;;
+esac
+
+container_download="${download_server}/${download_path}/Container/${arch}/images"
+container_image="Fedora-Container-Base-${version}-${release}.${arch}.tar.xz"
+container_check="Fedora-Container-${check_code}-CHECKSUM"
+
+server_download="${download_server}/${download_path}/Server/${arch}/images"
+server_image="Fedora-Server-${version}-${release}.${arch}.raw.xz"
+server_check="Fedora-Server-${check_code}-CHECKSUM"
+
+if [[ -z ${verbose} ]]; then
+	wget_extra="-q"
+	sum_extra="--status"
+else
+	wget_extra=""
+	sum_extra=""
+fi
+
+get_image () {
+	local path="${1}"
+	local image="${2}"
+	local check="${3}"
+
+	wget ${wget_extra} -N "${path}/${image}" "${path}/${check}"
+
+	grep "^SHA256 (${image}" "${check}" | sha256sum ${sum_extra} -c
+}
+
+get_rpm () {
+	# TODO
+	local path="https://rpmfind.net/linux/fedora/linux/updates/${version}/Everything/${arch}/Packages/k/"
+	local ver="4.17.18-200.fc28.${arch}"
+	local kernel="kernel-core-${ver}.rpm"
+	local modules="kernel-modules-${ver}.rpm"
+
+	wget ${wget_extra} -N "${path}/${kernel}" "${path}/${modules}"
+}
+
+cleanup_container () {
+	set +e
+	# nop
+	set -e
+}
+
+extract_container () {
+	return 0
+
+	local outdir="${1}"
+	local image="${2}"
+
+	trap cleanup_container exit
+	# nop
+	trap - exit
+	cleanup_container
+}
+
+cleanup_server () {
+	local loop="${1}"
+
+	set +e
+
+	sudo umount ./boot
+	rm -rf ./boot
+
+	sudo umount ./root
+	rm -rf ./root
+	sudo vgchange --activate n fedora
+
+	sudo kpartx -d -v /dev/${loop}
+	sudo losetup -d /dev/${loop}
+	set -e
+}
+
+extract_server () {
+	local outdir="${1}"
+	local image="${2}"
+	local loop="${3}"
+
+	local rootfs_raw="server-f${release}.${arch}-rootfs.raw"
+	local rootfs="${outdir}/server-f${release}.${arch}-rootfs.tar.gz"
+	local kernel="${outdir}/packet-f${release}.${arch}-kernel.tar.gz"
+	local modules="${outdir}/packet-f${release}.${arch}-modules.tar.gz"
+	local initrd="${outdir}/packet-f${release}.${arch}-initrd.tar.gz"
+
+
+	sudo rm -f ${rootfs}
+	cat ${image} | xzcat > ${rootfs_raw}
+
+	[[ -z ${verbose} ]] || fdisk -l ${rootfs_raw}
+
+	trap "cleanup_server ${loop}" exit
+
+	sudo losetup /dev/${loop} ${rootfs_raw}
+	sudo fdisk -l /dev/${loop}
+	sudo kpartx -a -r -v -s /dev/${loop}
+	#[[ -z ${verbose} ]] || find /dev -name '*loop0*'
+
+	mkdir -p ./boot
+	sudo mount -o ro /dev/mapper/${loop}p2 ./boot
+	sudo cp ./boot/vmlinuz-* ./boot/initramfs-* .
+	sudo chown ${USER}: vmlinuz-* initramfs-*
+
+	cp --link vmlinuz-* vmlinuz
+	tar -czf ${kernel} vmlinuz
+	rm -f vmlinuz
+
+	cp --link initramfs-* initrd
+	tar -czf ${initrd} initrd
+	rm -f initrd
+
+	mkdir -p ./root
+	[[ -z ${verbose} ]] || sudo vgscan -v
+	[[ -z ${verbose} ]] || sudo pvs
+	sudo vgchange --activate y fedora
+	sudo mount -o ro /dev/fedora/root ./root
+
+	mkdir -p ./lib
+	sudo cp -a ./root/lib/modules ./lib
+	sudo tar -czf ${modules} lib
+	sudo chown ${USER}: ${modules}
+
+	sudo tar -C ./root -czf ${rootfs} .
+	sudo chown ${USER}: ${rootfs}
+
+	trap - exit
+	cleanup_server ${loop}
+}
+
+sudo true
+
+workdir="${outdir}/work"
+mkdir -p "${outdir}" "${workdir}"
+cd "${workdir}"
+
+get_image "${container_download}" "${container_image}" "${container_check}"
+extract_container "${outdir}" "${container_image}"
+
+get_image "${server_download}" "${server_image}" "${server_check}"
+extract_server "${outdir}" "${server_image}" "loop0"
+
+echo "${name}: Success"
